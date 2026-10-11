@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "paul.jellyfin",
+  "name": "Jellyfin Cinema",
+  "version": "1.0.1",
+  "author": "Paul",
+  "license": "MIT",
+  "description": "Browse Jellyfin movie posters and play tiled in mpv, with terminal subtitles and now-playing artwork.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Cinema.qml"
+  },
+  "barWidget": {
+    "displayName": "Jellyfin Cinema",
+    "category": "Media",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

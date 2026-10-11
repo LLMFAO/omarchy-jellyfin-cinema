@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Native Jellyfin library + mpv playback. Credentials never appear in argv."""
+import concurrent.futures, fcntl, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, time, uuid
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home()/".config"))/"jellyfin-cinema/config.json"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home()/".cache"))/"jellyfin-cinema/posters"
+DEVICE = "omarchy-cinema-"+socket.gethostname()
+CLASS = "jellyfin-cinema"
+def load():
+    secure_directory(CONFIG.parent)
+    if not CONFIG.exists(): return {"server": ""}
+    if CONFIG.is_symlink() or not CONFIG.is_file(): raise ValueError('Refusing to read unsafe Jellyfin account data.')
+    os.chmod(CONFIG,0o600)
+    return json.loads(CONFIG.read_text())
+def secure_directory(path):
+    path.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.chmod(path,0o700)
+def save(cfg):
+    secure_directory(CONFIG.parent)
+    fd, name = tempfile.mkstemp(dir=CONFIG.parent)
+    with os.fdopen(fd, "w") as f: json.dump(cfg, f)
+    os.chmod(name, 0o600); os.replace(name, CONFIG)
+def valid_url(url):
+    url = url.strip().rstrip("/"); parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+        raise ValueError("Enter an HTTP(S) server URL without credentials, query or fragment.")
+    return url
+class API:
+    def __init__(self,cfg): self.cfg=cfg
+    def request(self, path, data=None, raw=False):
+        auth = 'MediaBrowser Client="Omarchy Cinema", Device="Omarchy", DeviceId="'+DEVICE+'", Version="1.0.1"'
+        if self.cfg.get("token"): auth += ', Token="'+self.cfg["token"]+'"'
+        headers={"Authorization":auth, "Content-Type":"application/json"}
+        req=Request(self.cfg["server"]+path, headers=headers, data=json.dumps(data).encode() if data is not None else None)
+        with build_opener(SameOriginRedirectHandler()).open(req,timeout=20) as r: content=r.read()
+        return content if raw else (json.loads(content) if content else {})
+
+class SameOriginRedirectHandler(HTTPRedirectHandler):
+    @staticmethod
+    def origin(url):
+        parts=urlsplit(url)
+        if parts.scheme not in ('http','https') or not parts.hostname or parts.username or parts.password:
+            raise ValueError('Jellyfin returned an unsafe redirect; check the server URL.')
+        port=parts.port or (443 if parts.scheme=='https' else 80)
+        return parts.scheme.lower(),parts.hostname.lower(),port
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if self.origin(req.full_url)!=self.origin(newurl):
+            raise ValueError('Jellyfin redirected to a different origin; refusing to forward the session token.')
+        return super().redirect_request(req,fp,code,msg,headers,newurl)
+def playback_lock(cfg):
+    identity=hashlib.sha256((cfg['server']+'\0'+cfg.get('user','')).encode()).hexdigest()[:24]
+    path=CONFIG.parent/('playback-'+identity+'.lock')
+    secure_directory(CONFIG.parent)
+    fd=os.open(path,os.O_CREAT|os.O_RDWR,0o600)
+    os.chmod(path,0o600)
+    return fd
+
+def player_state_path(cfg):
+    fd=playback_lock(cfg)
+    path=Path(os.readlink('/proc/self/fd/'+str(fd))).with_suffix('.json')
+    os.close(fd)
+    return path
+
+def store_player_state(cfg,state):
+    path=player_state_path(cfg); path.parent.mkdir(parents=True,exist_ok=True)
+    fd,name=tempfile.mkstemp(dir=path.parent)
+    with os.fdopen(fd,'w') as f: json.dump(state,f)
+    os.chmod(name,0o600); os.replace(name,path)
+
+def active_sessions(cfg):
+    active=[]
+    if cfg.get('token'):
+        secure_directory(CACHE)
+        for session in API(cfg).request('/Sessions'):
+            item=session.get('NowPlayingItem')
+            if not item or item.get('MediaType')!='Video': continue
+            record={'title':item.get('Name','Movie'),'device':session.get('DeviceName') or session.get('Client','Jellyfin device'),'paused':bool(session.get('PlayState',{}).get('IsPaused',False)), 'local':session.get('DeviceId')==DEVICE,'poster':''}
+            tag=item.get('ImageTags',{}).get('Primary')
+            if tag and item.get('Id'):
+                filename=re.sub(r'[^a-zA-Z0-9_-]','',item['Id']+'-'+tag)+'.jpg'; image=CACHE/filename
+                if not image.exists():
+                    try:
+                        secure_directory(CACHE)
+                        content=API(cfg).request('/Items/'+item['Id']+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80,'tag':tag}),raw=True)
+                        fd,temp=tempfile.mkstemp(dir=CACHE)
+                        with os.fdopen(fd,'wb') as f: f.write(content)
+                        os.chmod(temp,0o600); os.replace(temp,image)
+                    except Exception: pass
+                if image.exists(): record['poster']=image.as_uri()
+            active.append(record)
+    return active
+
+def playback_status(cfg):
+    local=False
+    fd=playback_lock(cfg)
+    try:
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: local=True
+        else: fcntl.flock(fd,fcntl.LOCK_UN)
+    finally: os.close(fd)
+    active=active_sessions(cfg)
+    state={}
+    if local:
+        try: state=json.loads(player_state_path(cfg).read_text())
+        except (OSError,ValueError): pass
+        if not any(x['local'] for x in active) and state:
+            active.insert(0,{'title':state.get('title','Movie'),'device':'This computer','paused':False,'local':True,'poster':state.get('poster','')})
+        for entry in active:
+            if entry['local'] and state:
+                entry['subtitleStyle']=state.get('subtitleStyle','terminal'); entry['subtitleSize']=state.get('subtitleSize',34)
+                if state.get('poster'): entry['poster']=state['poster']
+    return {'playing':local or bool(active),'localPlaying':local,'sessions':active}
+
+def library(cfg, query, start):
+    api=API(cfg)
+    if not cfg.get("token"): return {"items":[], "total":0, "loggedIn":False, "message":"Connect to your Jellyfin account."}
+    params={"Recursive":"true", "IncludeItemTypes":"Movie", "SortBy":"SortName", "SortOrder":"Ascending", "Limit":24, "StartIndex":start, "Fields":"Overview,MediaSources", "EnableUserData":"true"}
+    if query: params["SearchTerm"]=query
+    data=api.request('/Users/'+cfg["user"]+'/Items?'+urlencode(params))
+    secure_directory(CACHE)
+    def poster(item):
+        tag=item.get("ImageTags",{}).get("Primary")
+        if not tag: return ""
+        name=re.sub(r'[^a-zA-Z0-9_-]', '', item["Id"]+'-'+tag)+'.jpg'; file=CACHE/name
+        if not file.exists():
+            try:
+                content=api.request('/Items/'+item["Id"]+'/Images/Primary?'+urlencode({"maxWidth":180,"quality":80,"tag":tag}),raw=True)
+                fd,temp=tempfile.mkstemp(dir=CACHE)
+                with os.fdopen(fd,'wb') as f: f.write(content)
+                os.replace(temp,file)
+            except Exception: return ""
+        return file.as_uri()
+    source=data.get("Items",[])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool: posters=list(pool.map(poster,source))
+    return {"items":[{"id":i["Id"],"name":i["Name"],"year":i.get("ProductionYear", ""),"poster":poster,"resume":i.get("UserData",{}).get("PlaybackPositionTicks",0)>0} for i,poster in zip(source,posters)], "total":data.get("TotalRecordCount",0), "loggedIn":True,"sessions":playback_status(cfg)["sessions"],"message":"Choose a poster to play."}
+def dispatch(lua):
+    r=subprocess.run(["hyprctl","dispatch",lua],check=True,capture_output=True,text=True)
+    if r.stdout.startswith("error:"): raise ValueError("Window action failed.")
+def windows():
+    return [w for w in json.loads(subprocess.check_output(["hyprctl","clients","-j"])) if w.get("class")==CLASS]
+def play(cfg, itemid):
+    lockfd=playback_lock(cfg)
+    try: fcntl.flock(lockfd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lockfd); raise ValueError('A Jellyfin movie is already playing on this machine.')
+    try:
+        sessions=active_sessions(cfg)
+        if sessions:
+            raise ValueError('A movie is already playing on '+sessions[0]['device']+'. Stop it before starting another.')
+    except Exception:
+        fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd); raise
+    try:
+        return _play_locked(cfg,itemid)
+    finally:
+        fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd)
+
+def _play_locked(cfg, itemid):
+    if not re.fullmatch(r'[a-zA-Z0-9-]+',itemid): raise ValueError("Invalid movie ID")
+    if not shutil.which("mpv"): raise ValueError("Install mpv to play movies.")
+    api=API(cfg); item=api.request('/Users/'+cfg['user']+'/Items/'+itemid)
+    info=api.request('/Items/'+itemid+'/PlaybackInfo?'+urlencode({"UserId":cfg['user'],"EnableDirectPlay":"true","EnableDirectStream":"true"}),{})
+    sources=info.get('MediaSources',[])
+    if not sources: raise ValueError("No playable media source.")
+    source=sources[0]; session=info.get('PlaySessionId',str(uuid.uuid4()))
+    url=cfg['server']+'/Videos/'+itemid+'/stream?'+urlencode({"static":"true","MediaSourceId":source['Id']})
+    ticks=item.get('UserData',{}).get('PlaybackPositionTicks',0)
+    payload={"ItemId":itemid,"MediaSourceId":source['Id'],"PlaySessionId":session,"PositionTicks":ticks,"PlayMethod":"DirectPlay","CanSeek":True,"IsPaused":False}
+    filename=re.sub(r'[^a-zA-Z0-9_-]','',item['Id']+'-'+item.get('ImageTags',{}).get('Primary',''))+'.jpg'
+    poster=(CACHE/filename).as_uri() if filename and (CACHE/filename).exists() else ''
+    if not poster and item.get('ImageTags',{}).get('Primary'):
+        try:
+            secure_directory(CACHE)
+            content=api.request('/Items/'+itemid+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80}),raw=True)
+            (CACHE/filename).write_bytes(content); os.chmod(CACHE/filename,0o600); poster=(CACHE/filename).as_uri()
+        except Exception: pass
+    with tempfile.TemporaryDirectory(prefix='jellyfin-cinema-') as tmp:
+        conf=Path(tmp)/'mpv.conf'; ipc=str(Path(tmp)/'ipc')
+        subtitle=load_subtitle_settings(cfg)
+        # Token is only in a mode-600 private config, never in a URL or process arguments.
+        conf.write_text('http-header-fields="Authorization: MediaBrowser Token='+cfg['token']+'"\n'+subtitle_options(subtitle['style'],subtitle['size'])); conf.chmod(0o600)
+        proc=subprocess.Popen(['mpv','--include='+str(conf),'--wayland-app-id='+CLASS,'--title='+item['Name'],'--input-ipc-server='+ipc,'--start='+str(ticks/10000000),'--force-window=yes',url],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        started=False; last=0; pos=ticks
+        try:
+            for _ in range(100):
+                if Path(ipc).exists() or proc.poll() is not None: break
+                time.sleep(.1)
+            if proc.poll() is not None: raise ValueError("Player could not open this movie.")
+            store_player_state(cfg,{'pid':proc.pid,'title':item['Name'],'itemId':itemid,'poster':poster,'ipc':ipc,'subtitleStyle':subtitle['style'],'subtitleSize':subtitle['size']})
+            sock=socket.socket(socket.AF_UNIX); sock.settimeout(3); sock.connect(ipc); stream=sock.makefile('r')
+            def prop(name):
+                sock.sendall((json.dumps({"command":["get_property",name],"request_id":1})+'\n').encode())
+                while True:
+                    response=json.loads(stream.readline())
+                    if response.get('request_id')==1: return response.get('data')
+            while proc.poll() is None:
+                try:
+                    seconds=prop('time-pos'); paused=prop('pause')
+                    if seconds is not None:
+                        pos=int(seconds*10000000); payload['PositionTicks']=pos; payload['IsPaused']=bool(paused)
+                        if not started:
+                            api.request('/Sessions/Playing',payload); started=True
+                        if time.monotonic()-last>10:
+                            api.request('/Sessions/Playing/Progress',payload); last=time.monotonic()
+                except (OSError,ValueError): pass
+                time.sleep(1)
+        finally:
+            try:
+                state=player_state_path(cfg)
+                saved=json.loads(state.read_text())
+                if saved.get('pid')==proc.pid: state.unlink(missing_ok=True)
+            except (OSError,ValueError): pass
+            if started:
+                payload['PositionTicks']=pos
+                try: api.request('/Sessions/Playing/Stopped',payload)
+                except Exception: pass
+            if proc.poll() is None: proc.terminate(); proc.wait(timeout=5)
+def load_subtitle_settings(cfg):
+    path=CONFIG.parent/'settings.json'
+    try: settings=json.loads(path.read_text())
+    except (OSError,ValueError): settings={}
+    return {'style':settings.get('subtitleStyle','terminal'),'size':max(20,min(64,int(settings.get('subtitleSize',34))))}
+
+def subtitle_options(style,size):
+    if style=='terminal':
+        values={'sub-font':'JetBrainsMono Nerd Font','sub-color':'#A9FFB2','sub-back-color':'#101710D8','sub-font-size':size,'sub-border-size':0,'sub-shadow-offset':0,'sub-ass-override':'force'}
+    else:
+        values={'sub-font':'sans-serif','sub-color':'#FFFFFF','sub-back-color':'#00000000','sub-font-size':size,'sub-border-size':3,'sub-shadow-offset':1,'sub-ass-override':'force'}
+    return ''.join(str(k)+'='+str(v)+'\n' for k,v in values.items())
+
+def ipc_command(ipc,command):
+    sock=socket.socket(socket.AF_UNIX);sock.settimeout(3);sock.connect(ipc)
+    try:
+        sock.sendall((json.dumps({'command':command,'request_id':73})+'\n').encode())
+        stream=sock.makefile('r')
+        while True:
+            response=json.loads(stream.readline())
+            if response.get('request_id')==73:
+                if response.get('error')!='success': raise ValueError('Could not update player subtitles.')
+                return
+    finally: sock.close()
+
+def set_subtitle(cfg,action):
+    state_path=player_state_path(cfg)
+    try: state=json.loads(state_path.read_text())
+    except (OSError,ValueError): raise ValueError('Start a movie first to adjust subtitles.')
+    if not state.get('ipc') or not Path(state['ipc']).exists(): raise ValueError('The movie player is not ready.')
+    prefs=load_subtitle_settings(cfg)
+    if action=='toggle': prefs['style']='default' if prefs['style']=='terminal' else 'terminal'
+    elif action=='larger': prefs['size']=min(64,prefs['size']+2)
+    elif action=='smaller': prefs['size']=max(20,prefs['size']-2)
+    options=subtitle_options(prefs['style'],prefs['size'])
+    for line in options.splitlines():
+        key,value=line.split('=',1)
+        if key=='sub-ass-override': continue
+        if key=='sub-font-size': value=int(value)
+        elif key in ('sub-border-size','sub-shadow-offset'): value=float(value)
+        ipc_command(state['ipc'],['set_property',key,value])
+    path=CONFIG.parent/'settings.json';fd,name=tempfile.mkstemp(dir=path.parent)
+    with os.fdopen(fd,'w') as f: json.dump({'subtitleStyle':prefs['style'],'subtitleSize':prefs['size']},f)
+    os.chmod(name,0o600);os.replace(name,path)
+    state.update(subtitleStyle=prefs['style'],subtitleSize=prefs['size']);store_player_state(cfg,state)
+    return {'subtitleStyle':prefs['style'],'subtitleSize':prefs['size'],'message':'Subtitles: '+prefs['style']+' · '+str(prefs['size'])+' px'}
+
+def main():
+    action=sys.argv[1] if len(sys.argv)>1 else 'status'; cfg=load()
+    if action=='login':
+        data=json.load(sys.stdin); server=valid_url(data['server'])
+        candidate={"server":server}; result=API(candidate).request('/Users/AuthenticateByName',{"Username":data['username'],"Pw":data.get('password','')})
+        candidate.update(token=result['AccessToken'],user=result['User']['Id'],username=result['User']['Name']); save(candidate)
+        result={"server":server,"loggedIn":True,"message":"Connected. Browse your movies."}
+    elif action=='status': result={"server":cfg['server'],"username":cfg.get('username',''),"loggedIn":bool(cfg.get('token')),"sessions":playback_status(cfg)['sessions'],"message":""}
+    elif action=='library': result=library(cfg,sys.argv[2] if len(sys.argv)>2 else '',int(sys.argv[3]) if len(sys.argv)>3 else 0)
+    elif action=='sessions': result=playback_status(cfg)
+    elif action in ('subtitle-toggle','subtitle-larger','subtitle-smaller'): result=set_subtitle(cfg,{'subtitle-toggle':'toggle','subtitle-larger':'larger','subtitle-smaller':'smaller'}[action]);result.update(playback_status(cfg))
+    elif action=='logout':
+        try: API(cfg).request('/Sessions/Logout',{})
+        except Exception: pass
+        save({"server":cfg['server']}); result={"loggedIn":False,"server":cfg['server'],"message":"Signed out."}
+    elif action=='play':
+        if not cfg.get('token'): raise ValueError('Connect first.')
+        subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'play-run',sys.argv[2]],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        result={"message":"Opening movie…"}
+    elif action=='play-run': play(cfg,sys.argv[2]); return
+    elif action in ('pin','compact','roomy'):
+        ws=windows()
+        if not ws: raise ValueError('Choose a movie first.')
+        target=json.dumps('address:'+ws[-1]['address'])
+        if not ws[-1]['floating']: dispatch('hl.dsp.window.float({window='+target+', action="set"})')
+        if action=='pin': dispatch('hl.dsp.window.pin({window='+target+'})')
+        else: dispatch('hl.dsp.window.resize({window='+target+', x='+('640, y=360' if action=='compact' else '1000, y=600')+'})')
+        result={"message":"Player updated."}
+    else: raise ValueError('Unknown action')
+    print(json.dumps(result))
+if __name__=='__main__':
+    try: main()
+    except Exception as e:
+        from urllib.error import HTTPError
+        message=str(e) if isinstance(e,ValueError) else ('Jellyfin rejected this request (HTTP '+str(e.code)+'). Check your login and permissions.' if isinstance(e,HTTPError) else 'Could not connect. Check the server and network, then retry.')
+        if len(sys.argv)>1 and sys.argv[1]=='play-run':
+            subprocess.run(['notify-send','Jellyfin Cinema',message],check=False)
+        print(message,file=sys.stderr); sys.exit(1)
