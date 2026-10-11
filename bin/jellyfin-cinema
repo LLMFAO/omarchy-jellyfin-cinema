@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Native Jellyfin library + mpv playback. Credentials never appear in argv."""
-import concurrent.futures, fcntl, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, time, uuid
+import concurrent.futures, fcntl, hashlib, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -8,6 +10,7 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home()/".config"))/"jellyfi
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home()/".cache"))/"jellyfin-cinema/posters"
 DEVICE = "omarchy-cinema-"+socket.gethostname()
 CLASS = "jellyfin-cinema"
+VERSION = "1.0.2"
 def load():
     secure_directory(CONFIG.parent)
     if not CONFIG.exists(): return {"server": ""}
@@ -30,7 +33,7 @@ def valid_url(url):
 class API:
     def __init__(self,cfg): self.cfg=cfg
     def request(self, path, data=None, raw=False):
-        auth = 'MediaBrowser Client="Omarchy Cinema", Device="Omarchy", DeviceId="'+DEVICE+'", Version="1.0.1"'
+        auth = 'MediaBrowser Client="Omarchy Cinema", Device="Omarchy", DeviceId="'+DEVICE+'", Version="'+VERSION+'"'
         if self.cfg.get("token"): auth += ', Token="'+self.cfg["token"]+'"'
         headers={"Authorization":auth, "Content-Type":"application/json"}
         req=Request(self.cfg["server"]+path, headers=headers, data=json.dumps(data).encode() if data is not None else None)
@@ -47,9 +50,72 @@ class SameOriginRedirectHandler(HTTPRedirectHandler):
         return parts.scheme.lower(),parts.hostname.lower(),port
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if self.origin(req.full_url)!=self.origin(newurl):
+        try:
+            same_origin=self.origin(req.full_url)==self.origin(newurl)
+        except ValueError:
+            fp.close()
+            raise
+        if not same_origin:
+            fp.close()
             raise ValueError('Jellyfin redirected to a different origin; refusing to forward the session token.')
         return super().redirect_request(req,fp,code,msg,headers,newurl)
+
+class JellyfinStreamProxy:
+    """Loopback-only bridge that keeps Jellyfin authorization out of mpv/FFmpeg."""
+    def __init__(self, upstream_url, token):
+        secret=secrets.token_urlsafe(32)
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version='HTTP/1.1'
+            def log_message(self,*args): pass
+            def do_GET(self): self.forward(False)
+            def do_HEAD(self): self.forward(True)
+            def forward(self,head):
+                if self.client_address[0]!='127.0.0.1' or self.path!='/'+secret:
+                    self.send_error(404); return
+                headers={'Authorization':'MediaBrowser Token='+token,'User-Agent':'Omarchy Jellyfin Cinema/'+VERSION}
+                for name in ('Range','If-Range'):
+                    value=self.headers.get(name)
+                    if value:
+                        if name=='Range' and not re.fullmatch(r'bytes=\d*-\d*',value):
+                            self.send_error(416); return
+                        headers[name]=value
+                req=Request(upstream_url,headers=headers,method='HEAD' if head else 'GET')
+                try:
+                    upstream=build_opener(SameOriginRedirectHandler()).open(req,timeout=30)
+                except HTTPError as exc:
+                    upstream=exc
+                except (OSError,URLError,ValueError):
+                    self.send_error(502,'Jellyfin stream request failed or redirected to another origin.'); return
+                with upstream:
+                    status=getattr(upstream,'status',getattr(upstream,'code',502))
+                    self.send_response(status)
+                    for name in ('Content-Type','Content-Length','Content-Range','Accept-Ranges','Last-Modified','ETag'):
+                        value=upstream.headers.get(name)
+                        if value is not None: self.send_header(name,value)
+                    self.send_header('Connection','close')
+                    self.end_headers()
+                    self.close_connection=True
+                    if not head and status not in (204,304):
+                        try:
+                            while True:
+                                chunk=upstream.read(1024*1024)
+                                if not chunk: break
+                                self.wfile.write(chunk)
+                        except OSError:
+                            pass
+        self.httpd=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        self.httpd.daemon_threads=True
+        self.secret=secret
+        self.thread=threading.Thread(target=self.httpd.serve_forever,daemon=True)
+    def start(self):
+        self.thread.start()
+        host,port=self.httpd.server_address
+        return 'http://'+host+':'+str(port)+'/'+self.secret
+    def close(self):
+        if self.thread.is_alive(): self.httpd.shutdown()
+        self.httpd.server_close()
+        if self.thread.is_alive(): self.thread.join(timeout=2)
+
 def playback_lock(cfg):
     identity=hashlib.sha256((cfg['server']+'\0'+cfg.get('user','')).encode()).hexdigest()[:24]
     path=CONFIG.parent/('playback-'+identity+'.lock')
@@ -176,47 +242,51 @@ def _play_locked(cfg, itemid):
             content=api.request('/Items/'+itemid+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80}),raw=True)
             (CACHE/filename).write_bytes(content); os.chmod(CACHE/filename,0o600); poster=(CACHE/filename).as_uri()
         except Exception: pass
-    with tempfile.TemporaryDirectory(prefix='jellyfin-cinema-') as tmp:
-        conf=Path(tmp)/'mpv.conf'; ipc=str(Path(tmp)/'ipc')
-        subtitle=load_subtitle_settings(cfg)
-        # Token is only in a mode-600 private config, never in a URL or process arguments.
-        conf.write_text('http-header-fields="Authorization: MediaBrowser Token='+cfg['token']+'"\n'+subtitle_options(subtitle['style'],subtitle['size'])); conf.chmod(0o600)
-        proc=subprocess.Popen(['mpv','--include='+str(conf),'--wayland-app-id='+CLASS,'--title='+item['Name'],'--input-ipc-server='+ipc,'--start='+str(ticks/10000000),'--force-window=yes',url],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        started=False; last=0; pos=ticks
-        try:
-            for _ in range(100):
-                if Path(ipc).exists() or proc.poll() is not None: break
-                time.sleep(.1)
-            if proc.poll() is not None: raise ValueError("Player could not open this movie.")
-            store_player_state(cfg,{'pid':proc.pid,'title':item['Name'],'itemId':itemid,'poster':poster,'ipc':ipc,'subtitleStyle':subtitle['style'],'subtitleSize':subtitle['size']})
-            sock=socket.socket(socket.AF_UNIX); sock.settimeout(3); sock.connect(ipc); stream=sock.makefile('r')
-            def prop(name):
-                sock.sendall((json.dumps({"command":["get_property",name],"request_id":1})+'\n').encode())
-                while True:
-                    response=json.loads(stream.readline())
-                    if response.get('request_id')==1: return response.get('data')
-            while proc.poll() is None:
-                try:
-                    seconds=prop('time-pos'); paused=prop('pause')
-                    if seconds is not None:
-                        pos=int(seconds*10000000); payload['PositionTicks']=pos; payload['IsPaused']=bool(paused)
-                        if not started:
-                            api.request('/Sessions/Playing',payload); started=True
-                        if time.monotonic()-last>10:
-                            api.request('/Sessions/Playing/Progress',payload); last=time.monotonic()
-                except (OSError,ValueError): pass
-                time.sleep(1)
-        finally:
+    proxy=JellyfinStreamProxy(url,cfg['token'])
+    try:
+        local_url=proxy.start()
+        with tempfile.TemporaryDirectory(prefix='jellyfin-cinema-') as tmp:
+            conf=Path(tmp)/'mpv.conf'; ipc=str(Path(tmp)/'ipc')
+            subtitle=load_subtitle_settings(cfg)
+            conf.write_text(subtitle_options(subtitle['style'],subtitle['size'])); conf.chmod(0o600)
+            proc=subprocess.Popen(['mpv','--include='+str(conf),'--wayland-app-id='+CLASS,'--title='+item['Name'],'--input-ipc-server='+ipc,'--start='+str(ticks/10000000),'--force-window=yes',local_url],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            started=False; last=0; pos=ticks
             try:
-                state=player_state_path(cfg)
-                saved=json.loads(state.read_text())
-                if saved.get('pid')==proc.pid: state.unlink(missing_ok=True)
-            except (OSError,ValueError): pass
-            if started:
-                payload['PositionTicks']=pos
-                try: api.request('/Sessions/Playing/Stopped',payload)
-                except Exception: pass
-            if proc.poll() is None: proc.terminate(); proc.wait(timeout=5)
+                for _ in range(100):
+                    if Path(ipc).exists() or proc.poll() is not None: break
+                    time.sleep(.1)
+                if proc.poll() is not None: raise ValueError("Player could not open this movie.")
+                store_player_state(cfg,{'pid':proc.pid,'title':item['Name'],'itemId':itemid,'poster':poster,'ipc':ipc,'subtitleStyle':subtitle['style'],'subtitleSize':subtitle['size']})
+                sock=socket.socket(socket.AF_UNIX); sock.settimeout(3); sock.connect(ipc); stream=sock.makefile('r')
+                def prop(name):
+                    sock.sendall((json.dumps({"command":["get_property",name],"request_id":1})+'\n').encode())
+                    while True:
+                        response=json.loads(stream.readline())
+                        if response.get('request_id')==1: return response.get('data')
+                while proc.poll() is None:
+                    try:
+                        seconds=prop('time-pos'); paused=prop('pause')
+                        if seconds is not None:
+                            pos=int(seconds*10000000); payload['PositionTicks']=pos; payload['IsPaused']=bool(paused)
+                            if not started:
+                                api.request('/Sessions/Playing',payload); started=True
+                            if time.monotonic()-last>10:
+                                api.request('/Sessions/Playing/Progress',payload); last=time.monotonic()
+                    except (OSError,ValueError): pass
+                    time.sleep(1)
+            finally:
+                try:
+                    state=player_state_path(cfg)
+                    saved=json.loads(state.read_text())
+                    if saved.get('pid')==proc.pid: state.unlink(missing_ok=True)
+                except (OSError,ValueError): pass
+                if started:
+                    payload['PositionTicks']=pos
+                    try: api.request('/Sessions/Playing/Stopped',payload)
+                    except Exception: pass
+                if proc.poll() is None: proc.terminate(); proc.wait(timeout=5)
+    finally:
+        proxy.close()
 def load_subtitle_settings(cfg):
     path=CONFIG.parent/'settings.json'
     try: settings=json.loads(path.read_text())
