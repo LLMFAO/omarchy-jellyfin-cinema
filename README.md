@@ -3,7 +3,7 @@
 An Omarchy 4 bar plugin: browse small movie posters directly in the popup, search your Jellyfin library, and choose a poster to launch a movie in a **tiled mpv window**. Browsing never opens a separate window. Four poster columns, 24 movies per page, resume labels, next/previous controls, and faster wheel/touch scrolling with recycled poster tiles.
 
 ## Requirements
-Omarchy 4 with its Quickshell plugin API and Lua Hyprland configuration, Python 3, mpv, and a reachable Jellyfin server. No Python packages, Chromium, daemon, sudo, or server modifications required. If missing: `sudo pacman -S --needed --noconfirm mpv python`.
+Omarchy 4 with its Quickshell plugin API and Lua Hyprland configuration, Python 3, mpv, and a reachable Jellyfin server. No extra Python modules, browser, daemon, or Jellyfin server modifications are required.
 
 ## Install
 Install from GitHub with `omarchy plugin add https://github.com/LLMFAO/omarchy-jellyfin-cinema.git --enable --yes`.
