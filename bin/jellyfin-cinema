@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Native Jellyfin library + mpv playback. Credentials never appear in argv."""
-import concurrent.futures, fcntl, hashlib, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
+import concurrent.futures, errno, fcntl, hashlib, json, os, re, secrets, shutil, socket, stat, subprocess, sys, tempfile, threading, time, unicodedata, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from pathlib import Path
@@ -10,7 +10,10 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home()/".config"))/"jellyfi
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home()/".cache"))/"jellyfin-cinema/posters"
 DEVICE = "omarchy-cinema-"+socket.gethostname()
 CLASS = "jellyfin-cinema"
-VERSION = "1.0.2"
+VERSION = "1.1.0"
+LAUNCH_STALE_SECONDS = 150
+DOWNLOAD_DEFAULT = Path.home()/"Downloads"/"Jellyfin Cinema"
+ART_CACHE_MAX_BYTES = 300*1024*1024
 def load():
     secure_directory(CONFIG.parent)
     if not CONFIG.exists(): return {"server": ""}
@@ -19,7 +22,9 @@ def load():
     return json.loads(CONFIG.read_text())
 def secure_directory(path):
     path.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if path.is_symlink() or not path.is_dir(): raise ValueError('Refusing an unsafe Jellyfin data directory.')
     os.chmod(path,0o700)
+
 def save(cfg):
     secure_directory(CONFIG.parent)
     fd, name = tempfile.mkstemp(dir=CONFIG.parent)
@@ -32,12 +37,30 @@ def valid_url(url):
     return url
 class API:
     def __init__(self,cfg): self.cfg=cfg
-    def request(self, path, data=None, raw=False):
+    def auth(self):
         auth = 'MediaBrowser Client="Omarchy Cinema", Device="Omarchy", DeviceId="'+DEVICE+'", Version="'+VERSION+'"'
         if self.cfg.get("token"): auth += ', Token="'+self.cfg["token"]+'"'
-        headers={"Authorization":auth, "Content-Type":"application/json"}
+        return auth
+    def open(self, path, headers=None, timeout=30):
+        request_headers={"Authorization":self.auth(),"User-Agent":"Omarchy Jellyfin Cinema/"+VERSION}
+        if headers: request_headers.update(headers)
+        req=Request(self.cfg["server"]+path,headers=request_headers)
+        return build_opener(SameOriginRedirectHandler()).open(req,timeout=timeout)
+    def request(self, path, data=None, raw=False, timeout=20, max_bytes=None):
+        headers={"Authorization":self.auth(), "Content-Type":"application/json"}
         req=Request(self.cfg["server"]+path, headers=headers, data=json.dumps(data).encode() if data is not None else None)
-        with build_opener(SameOriginRedirectHandler()).open(req,timeout=20) as r: content=r.read()
+        try:
+            with build_opener(SameOriginRedirectHandler()).open(req,timeout=timeout) as r:
+                if max_bytes is not None:
+                    try: declared=int(r.headers.get('Content-Length','0'))
+                    except ValueError: declared=0
+                    if declared>max_bytes: raise ValueError('Jellyfin artwork exceeded the size limit.')
+                    content=r.read(max_bytes+1)
+                    if len(content)>max_bytes: raise ValueError('Jellyfin artwork exceeded the size limit.')
+                else: content=r.read()
+        except HTTPError as exc:
+            exc.close()
+            raise
         return content if raw else (json.loads(content) if content else {})
 
 class SameOriginRedirectHandler(HTTPRedirectHandler):
@@ -116,19 +139,63 @@ class JellyfinStreamProxy:
         self.httpd.server_close()
         if self.thread.is_alive(): self.thread.join(timeout=2)
 
+class PlaybackStartError(ValueError):
+    pass
+
 def playback_lock(cfg):
-    identity=hashlib.sha256((cfg['server']+'\0'+cfg.get('user','')).encode()).hexdigest()[:24]
-    path=CONFIG.parent/('playback-'+identity+'.lock')
+    # This lock represents the one local player owned by this plugin on this
+    # machine. It must not vary when the server/account in config.json changes.
+    path=CONFIG.parent/'player.lock'
     secure_directory(CONFIG.parent)
-    fd=os.open(path,os.O_CREAT|os.O_RDWR,0o600)
+    fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
     os.chmod(path,0o600)
     return fd
 
 def player_state_path(cfg):
-    fd=playback_lock(cfg)
-    path=Path(os.readlink('/proc/self/fd/'+str(fd))).with_suffix('.json')
-    os.close(fd)
-    return path
+    return CONFIG.parent/'player.json'
+
+def launch_state_path(launch_id):
+    if not re.fullmatch(r'[a-f0-9]{32}',launch_id): raise ValueError('Invalid playback launch ID.')
+    return CONFIG.parent/('launch-'+launch_id+'.json')
+
+def save_launch_state(launch_id,state):
+    path=launch_state_path(launch_id)
+    secure_directory(path.parent)
+    fd,name=tempfile.mkstemp(dir=path.parent)
+    try:
+        state=dict(state); state['updatedAt']=time.time()
+        with os.fdopen(fd,'w') as f: json.dump(state,f)
+        os.chmod(name,0o600); os.replace(name,path)
+    finally:
+        try: os.unlink(name)
+        except FileNotFoundError: pass
+
+def read_launch_state(launch_id,consume=False):
+    path=launch_state_path(launch_id)
+    try: state=json.loads(path.read_text())
+    except (OSError,ValueError): return {'status':'failed','message':'Playback launch status expired.'}
+    if not isinstance(state,dict) or state.get('status') not in ('starting','ready','failed'):
+        return {'status':'failed','message':'Playback launch status is invalid.'}
+    if state.get('status')=='starting':
+        try: updated=float(state.get('updatedAt',0))
+        except (TypeError,ValueError): updated=0
+        if not (updated>0 and updated<time.time()+60) or time.time()-updated>LAUNCH_STALE_SECONDS:
+            path.unlink(missing_ok=True)
+            return {'status':'failed','message':'Movie startup timed out. Try again.'}
+    if consume and state.get('status') in ('ready','failed'): path.unlink(missing_ok=True)
+    return state
+
+def launch_pending(launch_id):
+    path=launch_state_path(launch_id)
+    try: state=json.loads(path.read_text())
+    except (OSError,ValueError): return False
+    if not isinstance(state,dict) or state.get('status')!='starting': return False
+    try: updated=float(state.get('updatedAt',0))
+    except (TypeError,ValueError): updated=0
+    if not (updated>0 and updated<time.time()+60) or time.time()-updated>LAUNCH_STALE_SECONDS:
+        path.unlink(missing_ok=True)
+        return False
+    return True
 
 def store_player_state(cfg,state):
     path=player_state_path(cfg); path.parent.mkdir(parents=True,exist_ok=True)
@@ -139,23 +206,20 @@ def store_player_state(cfg,state):
 def active_sessions(cfg):
     active=[]
     if cfg.get('token'):
-        secure_directory(CACHE)
+        cache=account_cache(cfg)
         for session in API(cfg).request('/Sessions'):
+            # An administrator may see sessions for several users. Exclude
+            # records without an owner rather than risk showing another user's
+            # playback in the connected account's widget.
+            owner=session.get('UserId')
+            if not cfg.get('user') or owner!=cfg['user']: continue
             item=session.get('NowPlayingItem')
             if not item or item.get('MediaType')!='Video': continue
-            record={'title':item.get('Name','Movie'),'device':session.get('DeviceName') or session.get('Client','Jellyfin device'),'paused':bool(session.get('PlayState',{}).get('IsPaused',False)), 'local':session.get('DeviceId')==DEVICE,'poster':''}
-            tag=item.get('ImageTags',{}).get('Primary')
-            if tag and item.get('Id'):
-                filename=re.sub(r'[^a-zA-Z0-9_-]','',item['Id']+'-'+tag)+'.jpg'; image=CACHE/filename
-                if not image.exists():
-                    try:
-                        secure_directory(CACHE)
-                        content=API(cfg).request('/Items/'+item['Id']+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80,'tag':tag}),raw=True)
-                        fd,temp=tempfile.mkstemp(dir=CACHE)
-                        with os.fdopen(fd,'wb') as f: f.write(content)
-                        os.chmod(temp,0o600); os.replace(temp,image)
-                    except Exception: pass
-                if image.exists(): record['poster']=image.as_uri()
+            item_id=item.get('Id',''); tag=item.get('ImageTags',{}).get('Primary')
+            record={'id':item_id,'imageTag':tag or '','title':item.get('Name','Movie'),'device':session.get('DeviceName') or session.get('Client','Jellyfin device'),'paused':bool(session.get('PlayState',{}).get('IsPaused',False)), 'local':session.get('DeviceId')==DEVICE,'poster':''}
+            if tag and item_id:
+                filename=re.sub(r'[^a-zA-Z0-9_-]','',item_id+'-'+tag)+'.jpg'; image=cache/filename
+                if image.is_file() and not image.is_symlink(): record['poster']=image.as_uri()
             active.append(record)
     return active
 
@@ -167,63 +231,740 @@ def playback_status(cfg):
         except BlockingIOError: local=True
         else: fcntl.flock(fd,fcntl.LOCK_UN)
     finally: os.close(fd)
-    active=active_sessions(cfg)
+    status_error=''
+    auth_expired=False
+    try: active=active_sessions(cfg)
+    except Exception as exc:
+        active=[]
+        status_error=error_message(exc)
+        auth_expired=isinstance(exc,HTTPError) and exc.code==401
     state={}
     if local:
         try: state=json.loads(player_state_path(cfg).read_text())
         except (OSError,ValueError): pass
-        if not any(x['local'] for x in active) and state:
-            active.insert(0,{'title':state.get('title','Movie'),'device':'This computer','paused':False,'local':True,'poster':state.get('poster','')})
+        if not isinstance(state,dict): state={}
+        if not any(x['local'] for x in active):
+            active.insert(0,{'title':state.get('title','Local playback'),'device':'This computer','paused':False,'local':True,'poster':state.get('poster','')})
         for entry in active:
             if entry['local'] and state:
                 entry['subtitleStyle']=state.get('subtitleStyle','terminal'); entry['subtitleSize']=state.get('subtitleSize',34)
                 if state.get('poster'): entry['poster']=state['poster']
-    return {'playing':local or bool(active),'localPlaying':local,'sessions':active}
+    active.sort(key=lambda entry:not entry['local'])
+    return {'playing':local or bool(active),'localPlaying':local,'sessions':active,'statusError':status_error,'authExpired':auth_expired}
 
 def library(cfg, query, start):
     api=API(cfg)
     if not cfg.get("token"): return {"items":[], "total":0, "loggedIn":False, "message":"Connect to your Jellyfin account."}
     params={"Recursive":"true", "IncludeItemTypes":"Movie", "SortBy":"SortName", "SortOrder":"Ascending", "Limit":24, "StartIndex":start, "Fields":"Overview,MediaSources", "EnableUserData":"true"}
     if query: params["SearchTerm"]=query
-    data=api.request('/Users/'+cfg["user"]+'/Items?'+urlencode(params))
-    secure_directory(CACHE)
+    try: data=api.request('/Users/'+cfg["user"]+'/Items?'+urlencode(params))
+    except HTTPError as exc:
+        if exc.code==401: return {"items":[],"total":0,"loggedIn":True,"authExpired":True,"message":"Jellyfin rejected the saved login. Sign out, then connect again."}
+        raise
+    cache=account_cache(cfg)
+    try: saved_keys={entry.get('key') for entry in offline_index()['entries'] if entry.get('accountKey')==account_key(cfg)}
+    except (OSError,ValueError,TypeError): saved_keys=set()
     def poster(item):
         tag=item.get("ImageTags",{}).get("Primary")
-        if not tag: return ""
-        name=re.sub(r'[^a-zA-Z0-9_-]', '', item["Id"]+'-'+tag)+'.jpg'; file=CACHE/name
-        if not file.exists():
-            try:
-                content=api.request('/Items/'+item["Id"]+'/Images/Primary?'+urlencode({"maxWidth":180,"quality":80,"tag":tag}),raw=True)
-                fd,temp=tempfile.mkstemp(dir=CACHE)
-                with os.fdopen(fd,'wb') as f: f.write(content)
-                os.replace(temp,file)
-            except Exception: return ""
-        return file.as_uri()
+        if not tag: return ('','')
+        name=re.sub(r'[^a-zA-Z0-9_-]', '', item["Id"]+'-'+tag)+'.jpg'; file=cache/name
+        # A page render must not wait for a wave of poster downloads.
+        return (file.as_uri() if file.is_file() and not file.is_symlink() else '',tag)
     source=data.get("Items",[])
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool: posters=list(pool.map(poster,source))
-    return {"items":[{"id":i["Id"],"name":i["Name"],"year":i.get("ProductionYear", ""),"poster":poster,"resume":i.get("UserData",{}).get("PlaybackPositionTicks",0)>0} for i,poster in zip(source,posters)], "total":data.get("TotalRecordCount",0), "loggedIn":True,"sessions":playback_status(cfg)["sessions"],"message":"Choose a poster to play."}
+    items=[]
+    for item in source:
+        poster_uri,image_tag=poster(item)
+        items.append({"id":item["Id"],"name":item["Name"],"year":item.get("ProductionYear", ""),"poster":poster_uri,"imageTag":image_tag,"resume":item.get("UserData",{}).get("PlaybackPositionTicks",0)>0,"downloaded":entry_key(account_key(cfg),item["Id"]) in saved_keys})
+    return {"items":items, "total":data.get("TotalRecordCount",0), "loggedIn":True,"message":"Choose a poster to play."}
+
+def private_json(path, default):
+    if not path.exists(): return default
+    if path.is_symlink() or not path.is_file(): raise ValueError('Refusing to read an unsafe Jellyfin data file.')
+    os.chmod(path,0o600)
+    try: return json.loads(path.read_text())
+    except (json.JSONDecodeError,UnicodeDecodeError) as exc: raise ValueError('Jellyfin offline data is damaged; remove the invalid data file after backing it up.') from exc
+
+def save_private_json(path, value):
+    secure_directory(path.parent)
+    fd,name=tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd,'w') as stream:
+            json.dump(value,stream,separators=(',',':'))
+            stream.flush(); os.fsync(stream.fileno())
+        os.chmod(name,0o600); os.replace(name,path)
+        dirfd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+        try: os.fsync(dirfd)
+        finally: os.close(dirfd)
+    finally:
+        try: os.unlink(name)
+        except FileNotFoundError: pass
+
+def settings_path(): return CONFIG.parent/'settings.json'
+def index_path(): return CONFIG.parent/'offline-index.json'
+def job_path(): return CONFIG.parent/'download-job.json'
+def download_lock_path(): return CONFIG.parent/'download.lock'
+def download_control_path(): return CONFIG.parent/'download-control.lock'
+def cancel_path(): return CONFIG.parent/'download-cancel.json'
+
+def account_key(cfg):
+    return hashlib.sha256((cfg.get('server','')+'\0'+cfg.get('user','')).encode()).hexdigest()[:24]
+
+def account_cache(cfg):
+    secure_directory(CACHE)
+    path=CACHE/account_key(cfg)
+    secure_directory(path)
+    return path
+
+def prune_artwork_cache():
+    """Keep private poster storage bounded across accounts on this machine."""
+    if CACHE.is_symlink() or not CACHE.is_dir(): return
+    files=[]; total=0
+    for account in CACHE.iterdir():
+        if account.is_symlink() or not account.is_dir(): continue
+        for image in account.iterdir():
+            if image.suffix.lower()!='.jpg' or image.is_symlink() or not image.is_file(): continue
+            try:
+                info=image.stat(); files.append((info.st_mtime,image,info.st_size)); total+=info.st_size
+            except OSError: pass
+    limit=ART_CACHE_MAX_BYTES
+    for _,image,size in sorted(files,key=lambda item:item[0]):
+        if total<=limit: break
+        try: image.unlink(); total-=size
+        except OSError: pass
+
+def load_settings():
+    settings=private_json(settings_path(),{})
+    if not isinstance(settings,dict): raise ValueError('Jellyfin settings are invalid.')
+    return settings
+
+def configured_download_root(create=False):
+    raw=load_settings().get('downloadDirectory') or str(DOWNLOAD_DEFAULT)
+    candidate=Path(raw).expanduser()
+    if not candidate.is_absolute(): raise ValueError('Choose an absolute offline download folder path.')
+    if candidate.is_symlink(): raise ValueError('The offline folder cannot be a symbolic link.')
+    root=candidate.resolve(strict=False)
+    if create:
+        root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        if root.is_symlink() or not root.is_dir(): raise ValueError('The offline folder is not a safe directory.')
+        if root.stat().st_uid!=os.getuid(): raise ValueError('The offline folder must be owned by your Linux user.')
+        os.chmod(root,0o700)
+    return root
+
+def set_download_directory(raw):
+    lockfd=acquire_download_lock()
+    if lockfd is None: raise ValueError('Wait for the active download to finish before changing its folder.')
+    try:
+        candidate=Path(raw).expanduser()
+        if not candidate.is_absolute(): raise ValueError('Choose an absolute folder path, such as ~/Downloads/Jellyfin Cinema.')
+        if candidate.is_symlink(): raise ValueError('The offline folder cannot be a symbolic link.')
+        root=candidate.resolve(strict=False)
+        index=prune_missing_offline_entries()
+        job=private_json(job_path(),{})
+        partial_exists=False
+        try:
+            if re.fullmatch(r'[a-f0-9]{24}',str(job.get('accountKey',''))) and re.fullmatch(r'[a-f0-9]{64}\.part',str(job.get('partFilename',''))):
+                partial_exists=(account_folder(job['accountKey'],create=False)/job['partFilename']).exists()
+        except (OSError,ValueError): pass
+        if index.get('entries') or job.get('status')=='running' or partial_exists:
+            raise ValueError('The offline folder is already in use. Delete saved downloads and clear any partial transfer before changing it.')
+        root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        if root.is_symlink() or not root.is_dir() or root.stat().st_uid!=os.getuid():
+            raise ValueError('Choose a directory owned by your Linux user.')
+        os.chmod(root,0o700)
+        settings=load_settings(); settings['downloadDirectory']=str(root)
+        save_private_json(settings_path(),settings)
+        return {'directory':str(root),'message':'Offline folder updated.'}
+    finally: fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd)
+
+def offline_index():
+    index=private_json(index_path(),{'version':1,'entries':[]})
+    if not isinstance(index,dict) or index.get('version')!=1 or not isinstance(index.get('entries'),list):
+        raise ValueError('Jellyfin offline index is invalid.')
+    return index
+
+def entry_key(account, item_id):
+    return hashlib.sha256((account+'\0'+item_id).encode()).hexdigest()
+
+def valid_generated_name(name):
+    return isinstance(name,str) and re.fullmatch(r'[a-z0-9_-]{1,96}\.[a-z0-9]{1,8}',name) is not None
+
+def account_folder(account, create=False):
+    if not re.fullmatch(r'[a-f0-9]{24}',account): raise ValueError('Invalid offline account key.')
+    root=configured_download_root(create=create)
+    folder=root/account
+    if create: folder.mkdir(mode=0o700,exist_ok=True)
+    if folder.is_symlink() or (folder.exists() and (not folder.is_dir() or folder.stat().st_uid!=os.getuid())):
+        raise ValueError('Refusing an unsafe offline account folder.')
+    if create: os.chmod(folder,0o700)
+    return folder
+
+def safe_entry_file(entry, require_exists=True):
+    if not isinstance(entry,dict) or not valid_generated_name(entry.get('filename')) or not re.fullmatch(r'[a-f0-9]{24}',str(entry.get('accountKey',''))):
+        raise ValueError('Offline download metadata is invalid.')
+    if not re.fullmatch(r'[a-f0-9]{64}',str(entry.get('key',''))) or entry.get('key')!=entry_key(entry['accountKey'],str(entry.get('itemId',''))):
+        raise ValueError('Offline movie identity is invalid.')
+    folder=account_folder(entry['accountKey'],create=False)
+    path=folder/entry['filename']
+    if path.is_symlink(): raise ValueError('Refusing an unsafe offline movie file.')
+    if path.exists() and (not path.is_file() or path.stat().st_uid!=os.getuid()): raise ValueError('Refusing an unsafe offline movie file.')
+    if require_exists and not path.is_file(): raise ValueError('This offline movie file is missing.')
+    return path
+
+def prune_missing_offline_entries():
+    # The download commit holds this same lock while writing the index and
+    # renaming completed media. Keep it across the existence check too,
+    # otherwise a refresh can prune the entry in that gap.
+    indexfd=offline_index_lock()
+    try:
+        index=offline_index(); kept=[]; changed=False
+        for entry in index['entries']:
+            try:
+                path=safe_entry_file(entry,require_exists=False)
+                if not path.exists():
+                    changed=True
+                    continue
+            except (OSError,ValueError):
+                continue
+            kept.append(entry)
+        if changed:
+            index['entries']=kept
+            save_private_json(index_path(),index)
+        return index
+    finally: fcntl.flock(indexfd,fcntl.LOCK_UN); os.close(indexfd)
+
+def offline_list():
+    cfg=load()
+    current_account=account_key(cfg) if cfg.get('token') and cfg.get('user') else None
+    index=prune_missing_offline_entries(); root=configured_download_root(create=False)
+    items=[]; used=0
+    for entry in index['entries']:
+        if current_account and entry.get('accountKey')!=current_account: continue
+        try: path=safe_entry_file(entry)
+        except (ValueError,OSError): continue
+        used+=path.stat().st_size
+        poster=''
+        tag=entry.get('imageTag','')
+        if tag and re.fullmatch(r'[a-zA-Z0-9_-]+',tag):
+            cache=CACHE/entry['accountKey']
+            name=re.sub(r'[^a-zA-Z0-9_-]','',entry.get('itemId','')+'-'+tag)+'.jpg'
+            image=cache/name
+            if image.is_file() and not image.is_symlink(): poster=image.as_uri()
+        items.append({'key':entry['key'],'itemId':entry['itemId'],'name':entry['title'],'year':entry.get('year',''),'poster':poster,'bytes':path.stat().st_size,'positionTicks':max(0,int(entry.get('positionTicks',0))),'durationTicks':max(0,int(entry.get('durationTicks',0)))})
+    job=private_json(job_path(),{})
+    if current_account and job.get('accountKey')!=current_account: job={}
+    active=download_is_active()
+    if job.get('status') in ('running','interrupted','failed') and not active:
+        if any(item.get('key')==job.get('key') for item in items):
+            job['status']='complete'; job['message']='Download ready for offline playback.'
+        else:
+            job['status']='interrupted'; job['message']='Previous download stopped; choose the same movie to resume.'
+        save_private_json(job_path(),job)
+    return {'items':items,'bytes':used,'directory':str(root),'job':job if job.get('status') not in ('complete','cancelled') else {},'active':active,'allAccounts':current_account is None}
+
+def acquire_download_lock():
+    secure_directory(CONFIG.parent)
+    fd=os.open(download_lock_path(),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+def download_is_active():
+    fd=acquire_download_lock()
+    if fd is None: return True
+    fcntl.flock(fd,fcntl.LOCK_UN); os.close(fd)
+    return False
+
+def save_download_job(state):
+    state=dict(state); state['updatedAt']=time.time()
+    save_private_json(job_path(),state)
+
+def cancellation_requested(account, item_id):
+    fd=os.open(download_control_path(),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        marker=private_json(cancel_path(),{})
+        return marker.get('accountKey')==account and marker.get('itemId')==item_id
+    finally:
+        fcntl.flock(fd,fcntl.LOCK_UN); os.close(fd)
+
+def download_control():
+    fd=os.open(download_control_path(),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    fcntl.flock(fd,fcntl.LOCK_EX)
+    return fd
+
+def offline_index_lock():
+    path=CONFIG.parent/'offline-index.lock'
+    secure_directory(CONFIG.parent)
+    fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    fcntl.flock(fd,fcntl.LOCK_EX)
+    return fd
+
+def download_cancel():
+    control=download_control()
+    try:
+        job=private_json(job_path(),{})
+        lockfd=os.open(download_lock_path(),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        try:
+            try: fcntl.flock(lockfd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                if job.get('status')!='running': raise ValueError('There is no active Jellyfin download to cancel.')
+                save_private_json(cancel_path(),{'accountKey':job.get('accountKey'),'itemId':job.get('itemId')})
+                return {'message':'Canceling download…','cancelRequested':True}
+            try:
+                if job.get('status') not in ('running','interrupted','failed'): raise ValueError('There is no active or partial Jellyfin download to cancel.')
+                index=offline_index(); committed=next((entry for entry in index['entries'] if entry.get('key')==job.get('key')),None)
+                if committed:
+                    try: complete=safe_entry_file(committed).is_file()
+                    except (ValueError,OSError): complete=False
+                    if complete:
+                        job.update(status='complete',filename=committed['filename'],bytes=committed.get('bytes',0),message='Download ready for offline playback.')
+                        save_download_job(job)
+                        return {'message':'The download is already complete.'}
+                part=job.get('partFilename','')
+                if not re.fullmatch(r'[a-f0-9]{64}\.part',part): raise ValueError('Partial download metadata is invalid.')
+                path=account_folder(job['accountKey'],create=False)/part
+                if path.is_symlink(): raise ValueError('Refusing an unsafe partial movie file.')
+                path.unlink(missing_ok=True)
+                job.update(status='cancelled',bytes=0,total=None,message='Partial download removed.')
+                save_download_job(job)
+                cancel_path().unlink(missing_ok=True)
+                return {'message':'Partial download removed.'}
+            finally: fcntl.flock(lockfd,fcntl.LOCK_UN)
+        finally: os.close(lockfd)
+    finally: fcntl.flock(control,fcntl.LOCK_UN); os.close(control)
+
+def title_slug(title):
+    value=unicodedata.normalize('NFKD',str(title)).encode('ascii','ignore').decode().lower()
+    slug=re.sub(r'[^a-z0-9]+','-',value).strip('-')[:60].strip('-')
+    return slug or 'movie'
+
+def response_extension(response):
+    disposition=response.headers.get('Content-Disposition','')
+    match=re.search(r"filename\*?=(?:UTF-8'')?(.*)",disposition,re.IGNORECASE)
+    filename=match.group(1).split(';',1)[0].strip().strip('"') if match else ''
+    filename=filename.replace('\\','/').rsplit('/',1)[-1]
+    suffix=Path(filename).suffix.lower().lstrip('.')
+    allowed={'3gp','asf','avi','divx','flv','m2t','m2ts','m4v','mkv','mov','mpg','mpeg','mts','ogv','ts','vob','webm','wmv'}
+    if suffix not in allowed:
+        kind=response.headers.get_content_type().lower()
+        suffix={'video/mp4':'mp4','video/x-matroska':'mkv','video/webm':'webm','video/quicktime':'mov','video/x-msvideo':'avi','video/mpeg':'mpeg'}.get(kind,'mkv')
+    return suffix
+
+def content_total(response, resumed_at):
+    if getattr(response,'status',200)==206:
+        value=response.headers.get('Content-Range','')
+        match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',value.strip(),re.IGNORECASE)
+        if not match or int(match.group(1))!=resumed_at or int(match.group(2))<resumed_at or int(match.group(2))!=int(match.group(3))-1:
+            raise ValueError('Jellyfin returned an invalid ranged download; retry to start again.')
+        length=response.headers.get('Content-Length')
+        if length is not None and int(length)!=int(match.group(2))-int(match.group(1))+1:
+            raise ValueError('Jellyfin returned an invalid ranged download size.')
+        return int(match.group(3))
+    value=response.headers.get('Content-Length')
+    if value is None: return None
+    try: total=int(value)
+    except ValueError: raise ValueError('Jellyfin returned an invalid movie size.')
+    if total<0: raise ValueError('Jellyfin returned an invalid movie size.')
+    return total
+
+def download_movie(cfg,item_id):
+    if not cfg.get('token') or not cfg.get('user'): raise ValueError('Connect to Jellyfin before downloading a movie.')
+    if not re.fullmatch(r'[a-zA-Z0-9-]+',item_id): raise ValueError('Invalid movie ID.')
+    lockfd=acquire_download_lock()
+    if lockfd is None: raise ValueError('Another Jellyfin download is already running.')
+    try:
+        current=load()
+        if any(current.get(k)!=cfg.get(k) for k in ('server','user','token')): raise ValueError('The Jellyfin account changed before this download started.')
+        cfg=current; account=account_key(cfg); key=entry_key(account,item_id)
+        indexfd=offline_index_lock()
+        try:
+            index=offline_index(); existing=next((item for item in index['entries'] if item.get('key')==key),None)
+            if existing:
+                existing_file=safe_entry_file(existing,require_exists=False)
+                if existing_file.exists(): raise ValueError('This movie is already saved for offline playback.')
+                index['entries']=[item for item in index['entries'] if item.get('key')!=key]
+                save_private_json(index_path(),index)
+        finally: fcntl.flock(indexfd,fcntl.LOCK_UN); os.close(indexfd)
+        api=API(cfg)
+        item=api.request('/Items/'+item_id+'?'+urlencode({'userId':cfg['user']}))
+        if item.get('Id')!=item_id: raise ValueError('Jellyfin returned a different movie than requested.')
+        title=str(item.get('Name') or 'Movie')[:200]
+        year=item.get('ProductionYear') or ''
+        duration=max(0,int(item.get('RunTimeTicks') or 0))
+        user_data=item.get('UserData') or {}
+        initial_position=max(0,int(user_data.get('PlaybackPositionTicks') or 0))
+        folder=account_folder(account,create=True)
+        part_name=hashlib.sha256((account+'\0'+item_id).encode()).hexdigest()+'.part'
+        part=folder/part_name
+        if part.is_symlink(): raise ValueError('Refusing an unsafe partial movie file.')
+        job=private_json(job_path(),{})
+        if job.get('status') in ('running','interrupted','failed') and (job.get('accountKey')!=account or job.get('itemId')!=item_id):
+            raise ValueError('Another movie has a partial download. Cancel or resume it before starting a different one.')
+        if part.exists():
+            info=part.lstat()
+            if part.is_symlink() or not part.is_file() or info.st_uid!=os.getuid() or info.st_nlink!=1:
+                raise ValueError('Refusing an unsafe partial movie file.')
+        resume=part.stat().st_size if part.exists() else 0
+        if resume and not (job.get('etag') or job.get('lastModified')):
+            part.unlink(); resume=0
+        validator=job.get('etag') if job.get('etag') and not str(job.get('etag')).startswith('W/') else job.get('lastModified','')
+        if not validator:
+            if part.exists(): part.unlink()
+            resume=0
+        state={'status':'running','accountKey':account,'itemId':item_id,'key':key,'title':title,'year':year,'durationTicks':duration,'initialPositionTicks':initial_position,'partFilename':part_name,'bytes':resume,'total':job.get('total') if resume else None,'etag':job.get('etag','') if resume else '','lastModified':job.get('lastModified','') if resume else '','message':'Downloading'}
+        save_download_job(state)
+        url='/Items/'+item_id+'/Download'
+        response=None
+        for attempt in range(2):
+            headers={}
+            if resume:
+                headers={'Range':'bytes='+str(resume)+'-','If-Range':validator}
+            try: response=api.open(url,headers=headers,timeout=60)
+            except HTTPError as exc:
+                if resume and exc.code==416 and attempt==0:
+                    exc.close(); part.unlink(missing_ok=True); resume=0; validator=''; continue
+                if exc.code==403:
+                    exc.close(); raise ValueError('Jellyfin denied this download (HTTP 403). Check the account’s download permission.')
+                if exc.code==401:
+                    exc.close(); raise ValueError('Jellyfin rejected the saved login. Sign out and connect again.')
+                exc.close(); raise
+            status=getattr(response,'status',200)
+            resumed=status==206 and resume>0
+            if resume and status not in (200,206):
+                response.close(); raise ValueError('Jellyfin returned an unsupported response while resuming; retry the download.')
+            if not resume and status!=200:
+                response.close(); raise ValueError('Jellyfin returned an unexpected response for the movie download.')
+            if resumed:
+                content_range=response.headers.get('Content-Range','')
+                match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',content_range.strip(),re.IGNORECASE)
+                if not match or int(match.group(1))!=resume:
+                    response.close(); part.unlink(missing_ok=True); raise ValueError('Jellyfin returned an invalid resume range; retry to start again.')
+                received_validator=response.headers.get('ETag','') or response.headers.get('Last-Modified','')
+                if received_validator and received_validator!=validator:
+                    response.close(); part.unlink(missing_ok=True); resume=0; validator=''; continue
+            break
+        if response is None: raise ValueError('Could not start the Jellyfin download.')
+        if resume and getattr(response,'status',200)==200:
+            part.unlink(missing_ok=True); resume=0
+        total=content_total(response,resume)
+        remaining=None if total is None else total-resume
+        if remaining is not None and remaining<0:
+            response.close(); raise ValueError('Jellyfin returned an invalid movie size.')
+        free=shutil.disk_usage(folder).free
+        if remaining is not None and remaining>free:
+            response.close(); raise ValueError('There is not enough free disk space for this movie.')
+        etag=response.headers.get('ETag','')
+        if etag.startswith('W/'): etag=''
+        last_modified=response.headers.get('Last-Modified','')
+        if resumed:
+            etag=etag or job.get('etag',''); last_modified=last_modified or job.get('lastModified','')
+        state.update(bytes=resume,total=total,etag=etag,lastModified=last_modified)
+        save_download_job(state)
+        flags=os.O_WRONLY|os.O_NOFOLLOW|(os.O_APPEND if resumed else os.O_CREAT|os.O_EXCL)
+        fd=os.open(part,flags,0o600)
+        os.fchmod(fd,0o600)
+        opened=os.fstat(fd)
+        if opened.st_uid!=os.getuid() or opened.st_nlink!=1 or not stat.S_ISREG(opened.st_mode) or (resumed and opened.st_size!=resume):
+            os.close(fd); response.close(); raise ValueError('The partial movie changed on disk; cancel it and download again.')
+        bytes_written=resume; last_update=time.monotonic()
+        try:
+            with response,os.fdopen(fd,'ab' if resumed else 'wb') as out:
+                while True:
+                    if cancellation_requested(account,item_id):
+                        raise InterruptedError('Download canceled.')
+                    chunk=response.read(1024*1024)
+                    if not chunk: break
+                    if shutil.disk_usage(folder).free<len(chunk): raise ValueError('Disk space ran out during the download. Free space, then retry this movie.')
+                    try: out.write(chunk)
+                    except OSError as exc:
+                        if exc.errno==errno.ENOSPC: raise ValueError('Disk space ran out during the download. Free space, then retry this movie.') from exc
+                        raise
+                    bytes_written+=len(chunk)
+                    now=time.monotonic()
+                    if now-last_update>=0.75:
+                        state.update(bytes=bytes_written,total=total,etag=etag,lastModified=last_modified)
+                        save_download_job(state); last_update=now
+                try: out.flush(); os.fsync(out.fileno())
+                except OSError as exc:
+                    if exc.errno==errno.ENOSPC: raise ValueError('Disk space ran out during the download. Free space, then retry this movie.') from exc
+                    raise
+        except InterruptedError:
+            part.unlink(missing_ok=True)
+            save_download_job(dict(state,status='cancelled',bytes=0,total=None,message='Partial download removed.'))
+            control=download_control()
+            try:
+                marker=private_json(cancel_path(),{})
+                if marker.get('accountKey')==account and marker.get('itemId')==item_id: cancel_path().unlink(missing_ok=True)
+            finally: fcntl.flock(control,fcntl.LOCK_UN); os.close(control)
+            raise ValueError('Download canceled; partial file removed.')
+        if total is not None and bytes_written!=total:
+            raise ValueError('The movie download ended early and was not saved as complete. Retry to resume.')
+        ext=response_extension(response)
+        filename=title_slug(title)+'-'+hashlib.sha256(item_id.encode()).hexdigest()[:10]+'.'+ext
+        final=folder/filename
+        if final.exists() or final.is_symlink(): raise ValueError('A file with this generated name already exists; remove the unindexed file before retrying.')
+        image_tag=(item.get('ImageTags') or {}).get('Primary','')
+        try:
+            if image_tag:
+                cache=account_cache(cfg); image_name=re.sub(r'[^a-zA-Z0-9_-]','',item_id+'-'+image_tag)+'.jpg'; image=cache/image_name
+                if not image.exists() or image.is_symlink():
+                    art=api.request('/Items/'+item_id+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80,'tag':image_tag}),raw=True,timeout=8,max_bytes=2*1024*1024)
+                    imagefd,temp=tempfile.mkstemp(dir=cache)
+                    with os.fdopen(imagefd,'wb') as out: out.write(art)
+                    os.chmod(temp,0o600); os.replace(temp,image); prune_artwork_cache()
+        except Exception: pass
+        control=download_control()
+        try:
+            marker=private_json(cancel_path(),{})
+            if marker.get('accountKey')==account and marker.get('itemId')==item_id:
+                part.unlink(missing_ok=True); cancel_path().unlink(missing_ok=True)
+                save_download_job(dict(state,status='cancelled',bytes=0,total=None,message='Partial download removed.'))
+                raise ValueError('Download canceled; partial file removed.')
+            entry={'key':key,'accountKey':account,'itemId':item_id,'title':title,'year':year,'durationTicks':duration,'positionTicks':initial_position,'imageTag':image_tag,'filename':filename,'bytes':bytes_written,'updatedAt':time.time()}
+            indexfd=offline_index_lock()
+            try:
+                index=offline_index(); index['entries']=[x for x in index['entries'] if x.get('key')!=key]; index['entries'].append(entry)
+                save_private_json(index_path(),index)
+                os.replace(part,final)
+                dirfd=os.open(folder,os.O_RDONLY|os.O_DIRECTORY)
+                try: os.fsync(dirfd)
+                finally: os.close(dirfd)
+            finally: fcntl.flock(indexfd,fcntl.LOCK_UN); os.close(indexfd)
+            save_download_job(dict(state,status='complete',filename=filename,bytes=bytes_written,total=bytes_written,message='Download ready for offline playback.'))
+            cancel_path().unlink(missing_ok=True)
+        finally: fcntl.flock(control,fcntl.LOCK_UN); os.close(control)
+        return {'message':'Saved '+title+' for offline playback.','key':key,'bytes':bytes_written}
+    except Exception as exc:
+        try:
+            job=private_json(job_path(),{})
+            if job.get('status')=='running':
+                job['status']='failed' if isinstance(exc,ValueError) else 'interrupted'
+                job['message']=str(exc)[:240] if isinstance(exc,ValueError) else 'Transfer interrupted; select the same movie to retry.'
+                save_download_job(job)
+        except Exception: pass
+        raise
+    finally:
+        fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd)
+
+def delete_offline_item(key):
+    if not re.fullmatch(r'[a-f0-9]{64}',key): raise ValueError('Invalid offline movie key.')
+    fd=playback_lock({})
+    try:
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            try: state=json.loads(player_state_path({}).read_text())
+            except (OSError,ValueError): state={}
+            if state.get('offlineKey')==key: raise ValueError('Stop this movie before deleting its offline file.')
+            raise ValueError('Stop local playback before deleting an offline movie.')
+        indexfd=offline_index_lock()
+        try:
+            index=offline_index(); entry=next((x for x in index['entries'] if x.get('key')==key),None)
+            if entry is None: raise ValueError('Offline movie not found.')
+            path=safe_entry_file(entry,require_exists=False)
+            if path.exists(): path.unlink()
+            index['entries']=[x for x in index['entries'] if x.get('key')!=key]
+            save_private_json(index_path(),index)
+            return {'message':'Offline movie deleted.','key':key}
+        finally: fcntl.flock(indexfd,fcntl.LOCK_UN); os.close(indexfd)
+    finally:
+        try: fcntl.flock(fd,fcntl.LOCK_UN)
+        except OSError: pass
+        os.close(fd)
+
+def update_offline_position(key,ticks):
+    indexfd=offline_index_lock()
+    try:
+        index=offline_index(); entry=next((x for x in index['entries'] if x.get('key')==key),None)
+        if entry is None: raise ValueError('Offline movie not found.')
+        duration=max(0,int(entry.get('durationTicks') or 0)); position=max(0,int(ticks))
+        if duration and position>=duration*95//100: position=0
+        entry['positionTicks']=position; entry['updatedAt']=time.time()
+        save_private_json(index_path(),index)
+    finally: fcntl.flock(indexfd,fcntl.LOCK_UN); os.close(indexfd)
+    return position
+
+def offline_progress_preview(cfg,key):
+    if not cfg.get('token') or not cfg.get('user'): raise ValueError('Connect to Jellyfin to compare resume positions.')
+    index=offline_index(); entry=next((x for x in index['entries'] if x.get('key')==key),None)
+    if entry is None: raise ValueError('Offline movie not found.')
+    if entry.get('accountKey')!=account_key(cfg): raise ValueError('Sign in to the Jellyfin account that downloaded this movie to compare progress.')
+    item=API(cfg).request('/Items/'+entry['itemId']+'?'+urlencode({'userId':cfg['user']}))
+    remote=max(0,int((item.get('UserData') or {}).get('PlaybackPositionTicks') or 0))
+    return {'key':key,'name':entry.get('title','Movie'),'localTicks':max(0,int(entry.get('positionTicks') or 0)),'serverTicks':remote,'durationTicks':max(0,int(entry.get('durationTicks') or 0)),'message':'Choose which resume position to keep.'}
+
+def offline_progress_sync(cfg,key,expected_remote):
+    if not cfg.get('token') or not cfg.get('user'): raise ValueError('Connect to Jellyfin before syncing resume progress.')
+    index=offline_index(); entry=next((x for x in index['entries'] if x.get('key')==key),None)
+    if entry is None: raise ValueError('Offline movie not found.')
+    if entry.get('accountKey')!=account_key(cfg): raise ValueError('Sign in to the Jellyfin account that downloaded this movie before syncing progress.')
+    expected_remote=max(0,int(expected_remote))
+    api=API(cfg); item=api.request('/Items/'+entry['itemId']+'?'+urlencode({'userId':cfg['user']}))
+    current=max(0,int((item.get('UserData') or {}).get('PlaybackPositionTicks') or 0))
+    if current!=expected_remote: raise ValueError('The server position changed since comparison. Compare again before choosing.')
+    local=max(0,int(entry.get('positionTicks') or 0))
+    try: api.request('/UserItems/'+entry['itemId']+'/UserData',{'ItemId':entry['itemId'],'PlaybackPositionTicks':local})
+    except HTTPError as exc:
+        if exc.code==403: raise ValueError('Jellyfin denied the progress update (HTTP 403).') from exc
+        if exc.code==404: raise ValueError('This Jellyfin server does not support the user-data update API needed to sync progress.') from exc
+        raise
+    return {'key':key,'message':'Local resume position sent to Jellyfin.','positionTicks':local}
+
+def offline_progress_keep_server(cfg,key,server_ticks):
+    if not cfg.get('token') or not cfg.get('user'): raise ValueError('Connect to Jellyfin before choosing a server resume position.')
+    server_ticks=max(0,int(server_ticks))
+    indexfd=offline_index_lock()
+    try:
+        index=offline_index(); entry=next((x for x in index['entries'] if x.get('key')==key),None)
+        if entry is None: raise ValueError('Offline movie not found.')
+        if entry.get('accountKey')!=account_key(cfg): raise ValueError('Sign in to the Jellyfin account that downloaded this movie before choosing its resume position.')
+        duration=max(0,int(entry.get('durationTicks') or 0))
+        position=0 if duration and server_ticks>=duration*95//100 else server_ticks
+        entry['positionTicks']=position; entry['updatedAt']=time.time()
+        save_private_json(index_path(),index)
+    finally: fcntl.flock(indexfd,fcntl.LOCK_UN); os.close(indexfd)
+    return {'key':key,'message':'Jellyfin’s server position is now saved on this device.','positionTicks':position}
+
+def posters(cfg,item_refs):
+    """Fetch artwork for only the visible library page, independent of search."""
+    if not cfg.get('token'): return {'posters':{}}
+    refs=[]
+    for ref in item_refs:
+        parts=ref.split('~',1)
+        if len(parts)!=2 or not re.fullmatch(r'[a-zA-Z0-9-]+',parts[0]) or not re.fullmatch(r'[a-zA-Z0-9_-]+',parts[1]): continue
+        if parts not in refs: refs.append(parts)
+    cache=account_cache(cfg)
+    api=API(cfg)
+    def fetch(ref):
+        item_id,tag=ref
+        try:
+            filename=re.sub(r'[^a-zA-Z0-9_-]','',item_id+'-'+tag)+'.jpg'
+            image=cache/filename
+            if not image.is_file() or image.is_symlink():
+                content=api.request('/Items/'+item_id+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80,'tag':tag}),raw=True,timeout=4,max_bytes=2*1024*1024)
+                fd,temp=tempfile.mkstemp(dir=cache)
+                try:
+                    with os.fdopen(fd,'wb') as out: out.write(content)
+                    os.chmod(temp,0o600); os.replace(temp,image)
+                    prune_artwork_cache()
+                finally:
+                    try: os.unlink(temp)
+                    except FileNotFoundError: pass
+            return item_id,{'tag':tag,'url':image.as_uri()}
+        except Exception:
+            return item_id,{'tag':tag,'url':''}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        return {'posters':dict(pool.map(fetch,refs))}
+
+def error_message(exc):
+    if isinstance(exc,HTTPError):
+        if exc.code==401: return 'Jellyfin no longer accepts this login. Sign out and connect again.'
+        if exc.code==403: return 'Jellyfin denied playback status access (HTTP 403). Your library remains available.'
+        return 'Jellyfin rejected the playback status request (HTTP '+str(exc.code)+'). Your library remains available.'
+    if isinstance(exc,ValueError):
+        return str(exc)
+    return 'Could not check Jellyfin playback status. Your library remains available; retry shortly.'
 def dispatch(lua):
     r=subprocess.run(["hyprctl","dispatch",lua],check=True,capture_output=True,text=True)
     if r.stdout.startswith("error:"): raise ValueError("Window action failed.")
 def windows():
     return [w for w in json.loads(subprocess.check_output(["hyprctl","clients","-j"])) if w.get("class")==CLASS]
-def play(cfg, itemid):
+def play(cfg, itemid, launch_id):
     lockfd=playback_lock(cfg)
     try: fcntl.flock(lockfd,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(lockfd); raise ValueError('A Jellyfin movie is already playing on this machine.')
     try:
-        sessions=active_sessions(cfg)
-        if sessions:
-            raise ValueError('A movie is already playing on '+sessions[0]['device']+'. Stop it before starting another.')
-    except Exception:
-        fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd); raise
-    try:
-        return _play_locked(cfg,itemid)
+        current=load()
+        if any(current.get(key)!=cfg.get(key) for key in ('server','user','token')):
+            raise ValueError('The Jellyfin account changed while this movie was starting. Choose it again.')
+        cfg=current
+        # Also catch a player started by 1.0.2, whose lock was account scoped.
+        if windows(): raise ValueError('A Jellyfin movie is already playing on this machine.')
+        return _play_locked(cfg,itemid,launch_id)
     finally:
         fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd)
 
-def _play_locked(cfg, itemid):
+def play_offline(key,launch_id):
+    if not re.fullmatch(r'[a-f0-9]{64}',key): raise ValueError('Invalid offline movie key.')
+    cfg=load(); lockfd=playback_lock(cfg)
+    try: fcntl.flock(lockfd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lockfd); raise ValueError('A Jellyfin movie is already playing on this machine.')
+    try:
+        if windows(): raise ValueError('A Jellyfin movie is already playing on this machine.')
+        index=offline_index(); entry=next((x for x in index['entries'] if x.get('key')==key),None)
+        if entry is None: raise ValueError('Offline movie not found.')
+        media=safe_entry_file(entry)
+        _play_offline_locked(entry,media,launch_id)
+    finally: fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd)
+
+def _play_offline_locked(entry,media,launch_id):
+    if not shutil.which('mpv'): raise ValueError('Install mpv to play movies.')
+    if not launch_pending(launch_id): raise PlaybackStartError('Movie startup timed out. Try again.')
+    try:
+        poster_path=CACHE/entry['accountKey']/(re.sub(r'[^a-zA-Z0-9_-]','',entry['itemId']+'-'+entry.get('imageTag',''))+'.jpg')
+        poster=poster_path.as_uri() if poster_path.is_file() and not poster_path.is_symlink() else ''
+    except Exception: poster=''
+    ticks=max(0,int(entry.get('positionTicks') or 0))
+    subtitle=load_subtitle_settings({})
+    with tempfile.TemporaryDirectory(prefix='jellyfin-cinema-') as tmp:
+        conf=Path(tmp)/'mpv.conf'; ipc=str(Path(tmp)/'ipc')
+        conf.write_text(subtitle_options(subtitle['style'],subtitle['size'])); conf.chmod(0o600)
+        proc=subprocess.Popen(['mpv','--include='+str(conf),'--wayland-app-id='+CLASS,'--title='+str(entry.get('title','Movie')),'--input-ipc-server='+ipc,'--start='+str(ticks/10000000),'--force-window=yes',str(media)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        sock=None; stream=None; ready=False; pos=ticks; last_saved=0; deadline=time.monotonic()+30
+        try:
+            for _ in range(100):
+                if Path(ipc).exists() or proc.poll() is not None: break
+                time.sleep(.1)
+            if proc.poll() is not None: raise ValueError('Player could not open this offline movie.')
+            store_player_state({}, {'pid':proc.pid,'title':entry.get('title','Movie'),'itemId':entry.get('itemId',''),'offline':True,'offlineKey':entry['key'],'poster':poster,'ipc':ipc,'subtitleStyle':subtitle['style'],'subtitleSize':subtitle['size']})
+            sock=socket.socket(socket.AF_UNIX); sock.settimeout(3); sock.connect(ipc); stream=sock.makefile('r')
+            request_id=0
+            def prop(name):
+                nonlocal request_id
+                request_id+=1
+                sock.sendall((json.dumps({'command':['get_property',name],'request_id':request_id})+'\n').encode())
+                while True:
+                    line=stream.readline()
+                    if not line: raise OSError('Player IPC closed.')
+                    response=json.loads(line)
+                    if response.get('request_id')==request_id: return response.get('data')
+            while proc.poll() is None:
+                if not ready and not launch_pending(launch_id): raise PlaybackStartError('Movie startup timed out. Try again.')
+                try: seconds=prop('time-pos')
+                except (OSError,ValueError) as exc: raise PlaybackStartError('Lost communication with mpv during offline playback.') from exc
+                if seconds is not None:
+                    if not ready:
+                        ready=True; save_launch_state(launch_id,{'status':'ready','message':'Offline movie is playing.'})
+                    pos=int(seconds*10000000)
+                    if time.monotonic()-last_saved>=15:
+                        update_offline_position(entry['key'],pos); last_saved=time.monotonic()
+                elif not ready and time.monotonic()>deadline:
+                    raise PlaybackStartError('The offline movie did not start within 30 seconds.')
+                time.sleep(1)
+            if not ready: raise PlaybackStartError('The player closed before offline playback started.')
+        finally:
+            if stream:
+                try: stream.close()
+                except OSError: pass
+            if sock:
+                try: sock.close()
+                except OSError: pass
+            try:
+                state=player_state_path({}); saved=json.loads(state.read_text())
+                if saved.get('pid')==proc.pid: state.unlink(missing_ok=True)
+            except (OSError,ValueError): pass
+            try: update_offline_position(entry['key'],pos)
+            except ValueError: pass
+            if proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait(timeout=5)
+
+def _play_locked(cfg, itemid, launch_id):
     if not re.fullmatch(r'[a-zA-Z0-9-]+',itemid): raise ValueError("Invalid movie ID")
     if not shutil.which("mpv"): raise ValueError("Install mpv to play movies.")
     api=API(cfg); item=api.request('/Users/'+cfg['user']+'/Items/'+itemid)
@@ -234,14 +975,24 @@ def _play_locked(cfg, itemid):
     url=cfg['server']+'/Videos/'+itemid+'/stream?'+urlencode({"static":"true","MediaSourceId":source['Id']})
     ticks=item.get('UserData',{}).get('PlaybackPositionTicks',0)
     payload={"ItemId":itemid,"MediaSourceId":source['Id'],"PlaySessionId":session,"PositionTicks":ticks,"PlayMethod":"DirectPlay","CanSeek":True,"IsPaused":False}
+    if not launch_pending(launch_id): raise PlaybackStartError('Movie startup timed out. Try again.')
+    cache=account_cache(cfg)
     filename=re.sub(r'[^a-zA-Z0-9_-]','',item['Id']+'-'+item.get('ImageTags',{}).get('Primary',''))+'.jpg'
-    poster=(CACHE/filename).as_uri() if filename and (CACHE/filename).exists() else ''
+    poster=(cache/filename).as_uri() if filename and (cache/filename).is_file() and not (cache/filename).is_symlink() else ''
     if not poster and item.get('ImageTags',{}).get('Primary'):
         try:
-            secure_directory(CACHE)
-            content=api.request('/Items/'+itemid+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80}),raw=True)
-            (CACHE/filename).write_bytes(content); os.chmod(CACHE/filename,0o600); poster=(CACHE/filename).as_uri()
+            content=api.request('/Items/'+itemid+'/Images/Primary?'+urlencode({'maxWidth':180,'quality':80}),raw=True,max_bytes=2*1024*1024)
+            fd,temp=tempfile.mkstemp(dir=cache)
+            try:
+                with os.fdopen(fd,'wb') as out: out.write(content)
+                os.chmod(temp,0o600); os.replace(temp,cache/filename)
+                prune_artwork_cache()
+            finally:
+                try: os.unlink(temp)
+                except FileNotFoundError: pass
+            poster=(cache/filename).as_uri()
         except Exception: pass
+    if not launch_pending(launch_id): raise PlaybackStartError('Movie startup timed out. Try again.')
     proxy=JellyfinStreamProxy(url,cfg['token'])
     try:
         local_url=proxy.start()
@@ -250,7 +1001,9 @@ def _play_locked(cfg, itemid):
             subtitle=load_subtitle_settings(cfg)
             conf.write_text(subtitle_options(subtitle['style'],subtitle['size'])); conf.chmod(0o600)
             proc=subprocess.Popen(['mpv','--include='+str(conf),'--wayland-app-id='+CLASS,'--title='+item['Name'],'--input-ipc-server='+ipc,'--start='+str(ticks/10000000),'--force-window=yes',local_url],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            started=False; last=0; pos=ticks
+            sock=None; stream=None
+            started=False; ready=False; last=0; last_start_attempt=0; pos=ticks
+            request_id=0
             try:
                 for _ in range(100):
                     if Path(ipc).exists() or proc.poll() is not None: break
@@ -259,22 +1012,47 @@ def _play_locked(cfg, itemid):
                 store_player_state(cfg,{'pid':proc.pid,'title':item['Name'],'itemId':itemid,'poster':poster,'ipc':ipc,'subtitleStyle':subtitle['style'],'subtitleSize':subtitle['size']})
                 sock=socket.socket(socket.AF_UNIX); sock.settimeout(3); sock.connect(ipc); stream=sock.makefile('r')
                 def prop(name):
-                    sock.sendall((json.dumps({"command":["get_property",name],"request_id":1})+'\n').encode())
+                    nonlocal request_id
+                    request_id+=1
+                    sock.sendall((json.dumps({"command":["get_property",name],"request_id":request_id})+'\n').encode())
                     while True:
-                        response=json.loads(stream.readline())
-                        if response.get('request_id')==1: return response.get('data')
+                        line=stream.readline()
+                        if not line: raise OSError('Player IPC closed.')
+                        response=json.loads(line)
+                        if response.get('request_id')==request_id: return response.get('data')
+                load_deadline=time.monotonic()+30
                 while proc.poll() is None:
-                    try:
-                        seconds=prop('time-pos'); paused=prop('pause')
-                        if seconds is not None:
-                            pos=int(seconds*10000000); payload['PositionTicks']=pos; payload['IsPaused']=bool(paused)
-                            if not started:
+                    if not ready and not launch_pending(launch_id): raise PlaybackStartError('Movie startup timed out. Try again.')
+                    try: seconds=prop('time-pos'); paused=prop('pause')
+                    except (OSError,ValueError) as exc:
+                        detail='mpv closed before playback started.' if not ready and proc.poll() is not None else 'Lost communication with mpv during playback.'
+                        raise PlaybackStartError(detail) from exc
+                    if seconds is not None:
+                        if not ready:
+                            ready=True
+                            save_launch_state(launch_id,{'status':'ready','message':'Movie is playing.'})
+                        pos=int(seconds*10000000); payload['PositionTicks']=pos; payload['IsPaused']=bool(paused)
+                        if not started and time.monotonic()-last_start_attempt>=10:
+                            try:
                                 api.request('/Sessions/Playing',payload); started=True
-                            if time.monotonic()-last>10:
-                                api.request('/Sessions/Playing/Progress',payload); last=time.monotonic()
-                    except (OSError,ValueError): pass
+                            except (OSError,URLError,ValueError): pass
+                            last_start_attempt=time.monotonic()
+                        if started and time.monotonic()-last>10:
+                            try: api.request('/Sessions/Playing/Progress',payload)
+                            except (OSError,URLError,ValueError): pass
+                            last=time.monotonic()
+                    elif not ready and time.monotonic()>load_deadline:
+                        raise PlaybackStartError('The movie did not start within 30 seconds. Check Jellyfin playback permissions and the network.')
                     time.sleep(1)
+                if not ready and proc.poll() is not None:
+                    raise PlaybackStartError('The player closed before the movie started.')
             finally:
+                if stream:
+                    try: stream.close()
+                    except OSError: pass
+                if sock:
+                    try: sock.close()
+                    except OSError: pass
                 try:
                     state=player_state_path(cfg)
                     saved=json.loads(state.read_text())
@@ -284,14 +1062,21 @@ def _play_locked(cfg, itemid):
                     payload['PositionTicks']=pos
                     try: api.request('/Sessions/Playing/Stopped',payload)
                     except Exception: pass
-                if proc.poll() is None: proc.terminate(); proc.wait(timeout=5)
+                if proc.poll() is None:
+                    proc.terminate()
+                    try: proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill(); proc.wait(timeout=5)
     finally:
         proxy.close()
 def load_subtitle_settings(cfg):
-    path=CONFIG.parent/'settings.json'
-    try: settings=json.loads(path.read_text())
+    try: settings=load_settings()
     except (OSError,ValueError): settings={}
-    return {'style':settings.get('subtitleStyle','terminal'),'size':max(20,min(64,int(settings.get('subtitleSize',34))))}
+    style=settings.get('subtitleStyle','terminal')
+    if style not in ('terminal','default'): style='terminal'
+    try: size=int(settings.get('subtitleSize',34))
+    except (TypeError,ValueError): size=34
+    return {'style':style,'size':max(20,min(64,size))}
 
 def subtitle_options(style,size):
     if style=='terminal':
@@ -328,9 +1113,8 @@ def set_subtitle(cfg,action):
         if key=='sub-font-size': value=int(value)
         elif key in ('sub-border-size','sub-shadow-offset'): value=float(value)
         ipc_command(state['ipc'],['set_property',key,value])
-    path=CONFIG.parent/'settings.json';fd,name=tempfile.mkstemp(dir=path.parent)
-    with os.fdopen(fd,'w') as f: json.dump({'subtitleStyle':prefs['style'],'subtitleSize':prefs['size']},f)
-    os.chmod(name,0o600);os.replace(name,path)
+    settings=load_settings(); settings.update(subtitleStyle=prefs['style'],subtitleSize=prefs['size'])
+    save_private_json(settings_path(),settings)
     state.update(subtitleStyle=prefs['style'],subtitleSize=prefs['size']);store_player_state(cfg,state)
     return {'subtitleStyle':prefs['style'],'subtitleSize':prefs['size'],'message':'Subtitles: '+prefs['style']+' · '+str(prefs['size'])+' px'}
 
@@ -338,22 +1122,91 @@ def main():
     action=sys.argv[1] if len(sys.argv)>1 else 'status'; cfg=load()
     if action=='login':
         data=json.load(sys.stdin); server=valid_url(data['server'])
+        if urlsplit(server).scheme=='http' and data.get('allowInsecureHttp') is not True:
+            raise ValueError('HTTP is not encrypted. Confirm that this is a trusted private network before connecting.')
+        if cfg.get('token'):
+            raise ValueError('Sign out of the current Jellyfin account before connecting again.')
         candidate={"server":server}; result=API(candidate).request('/Users/AuthenticateByName',{"Username":data['username'],"Pw":data.get('password','')})
         candidate.update(token=result['AccessToken'],user=result['User']['Id'],username=result['User']['Name']); save(candidate)
         result={"server":server,"loggedIn":True,"message":"Connected. Browse your movies."}
-    elif action=='status': result={"server":cfg['server'],"username":cfg.get('username',''),"loggedIn":bool(cfg.get('token')),"sessions":playback_status(cfg)['sessions'],"message":""}
+    elif action=='status': result={"server":cfg['server'],"username":cfg.get('username',''),"loggedIn":bool(cfg.get('token')),'message':''}
     elif action=='library': result=library(cfg,sys.argv[2] if len(sys.argv)>2 else '',int(sys.argv[3]) if len(sys.argv)>3 else 0)
     elif action=='sessions': result=playback_status(cfg)
-    elif action in ('subtitle-toggle','subtitle-larger','subtitle-smaller'): result=set_subtitle(cfg,{'subtitle-toggle':'toggle','subtitle-larger':'larger','subtitle-smaller':'smaller'}[action]);result.update(playback_status(cfg))
+    elif action=='launch-status': result=read_launch_state(sys.argv[2],consume=True)
+    elif action=='posters': result=posters(cfg,sys.argv[2].split(',') if len(sys.argv)>2 and sys.argv[2] else [])
+    elif action in ('subtitle-toggle','subtitle-larger','subtitle-smaller'): result=set_subtitle(cfg,{'subtitle-toggle':'toggle','subtitle-larger':'larger','subtitle-smaller':'smaller'}[action])
+    elif action in ('offline-list','download-status'): result=offline_list()
+    elif action=='download': result=download_movie(cfg,sys.argv[2])
+    elif action=='download-cancel': result=download_cancel()
+    elif action=='offline-delete': result=delete_offline_item(sys.argv[2])
+    elif action=='offline-set-directory': result=set_download_directory(sys.argv[2])
+    elif action=='offline-progress-preview': result=offline_progress_preview(cfg,sys.argv[2])
+    elif action=='offline-progress-sync': result=offline_progress_sync(cfg,sys.argv[2],sys.argv[3])
+    elif action=='offline-progress-keep-server': result=offline_progress_keep_server(cfg,sys.argv[2],sys.argv[3])
     elif action=='logout':
-        try: API(cfg).request('/Sessions/Logout',{})
-        except Exception: pass
-        save({"server":cfg['server']}); result={"loggedIn":False,"server":cfg['server'],"message":"Signed out."}
+        downloadfd=acquire_download_lock()
+        if downloadfd is None: raise ValueError('Wait for or cancel the active download before signing out.')
+        try:
+            lockfd=playback_lock(cfg)
+            try:
+                try: fcntl.flock(lockfd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError: raise ValueError('Stop the local movie before signing out.')
+                if windows(): raise ValueError('Stop the local movie before signing out.')
+                remote_logout_confirmed=True
+                if cfg.get('token'):
+                    try: API(cfg).request('/Sessions/Logout',{})
+                    except HTTPError as exc:
+                        if exc.code != 401: raise
+                        remote_logout_confirmed=False
+                save({"server":cfg.get('server','')}); result={"loggedIn":False,"server":cfg.get('server',''),"sessions":[],"message":"Signed out." if remote_logout_confirmed else "Local login cleared; Jellyfin no longer accepts the saved token."}
+            finally:
+                try: fcntl.flock(lockfd,fcntl.LOCK_UN)
+                except OSError: pass
+                os.close(lockfd)
+        finally:
+            try: fcntl.flock(downloadfd,fcntl.LOCK_UN)
+            except OSError: pass
+            os.close(downloadfd)
     elif action=='play':
         if not cfg.get('token'): raise ValueError('Connect first.')
-        subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'play-run',sys.argv[2]],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        result={"message":"Opening movie…"}
-    elif action=='play-run': play(cfg,sys.argv[2]); return
+        launch_id=uuid.uuid4().hex
+        save_launch_state(launch_id,{'status':'starting','message':'Starting movie…'})
+        try: subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'play-run',sys.argv[2],launch_id],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        except Exception:
+            launch_state_path(launch_id).unlink(missing_ok=True)
+            raise
+        deadline=time.monotonic()+8
+        while time.monotonic()<deadline:
+            state=read_launch_state(launch_id)
+            if state.get('status') in ('ready','failed'):
+                launch_state_path(launch_id).unlink(missing_ok=True)
+                result={'status':state['status'],'launchId':launch_id,'message':state.get('message','')}
+                break
+            time.sleep(.1)
+        else: result={'status':'starting','launchId':launch_id,'message':'Starting movie…'}
+    elif action=='play-offline':
+        launch_id=uuid.uuid4().hex
+        save_launch_state(launch_id,{'status':'starting','message':'Starting offline movie…'})
+        try: subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'play-offline-run',sys.argv[2],launch_id],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        except Exception:
+            launch_state_path(launch_id).unlink(missing_ok=True)
+            raise
+        deadline=time.monotonic()+8
+        while time.monotonic()<deadline:
+            state=read_launch_state(launch_id)
+            if state.get('status') in ('ready','failed'):
+                launch_state_path(launch_id).unlink(missing_ok=True)
+                result={'status':state['status'],'launchId':launch_id,'message':state.get('message','')}
+                break
+            time.sleep(.1)
+        else: result={'status':'starting','launchId':launch_id,'message':'Starting offline movie…'}
+    elif action=='play-run':
+        launch_id=sys.argv[3]
+        play(cfg,sys.argv[2],launch_id)
+        return
+    elif action=='play-offline-run':
+        play_offline(sys.argv[2],sys.argv[3])
+        return
     elif action in ('pin','compact','roomy'):
         ws=windows()
         if not ws: raise ValueError('Choose a movie first.')
@@ -368,7 +1221,15 @@ if __name__=='__main__':
     try: main()
     except Exception as e:
         from urllib.error import HTTPError
-        message=str(e) if isinstance(e,ValueError) else ('Jellyfin rejected this request (HTTP '+str(e.code)+'). Check your login and permissions.' if isinstance(e,HTTPError) else 'Could not connect. Check the server and network, then retry.')
-        if len(sys.argv)>1 and sys.argv[1]=='play-run':
+        if isinstance(e,ValueError): message=str(e)
+        elif isinstance(e,HTTPError) and e.code==401: message='Jellyfin rejected the saved login. Clear it, then connect again.'
+        elif isinstance(e,HTTPError) and e.code==403: message='Jellyfin denied this action (HTTP 403). Check the account permissions.'
+        elif isinstance(e,HTTPError): message='Jellyfin rejected this request (HTTP '+str(e.code)+'). Check the account permissions and retry.'
+        else: message='Could not connect. Check the server and network, then retry.'
+        if len(sys.argv)>1 and sys.argv[1] in ('play-run','play-offline-run'):
+            if len(sys.argv)>3:
+                try:
+                    if launch_pending(sys.argv[3]): save_launch_state(sys.argv[3],{'status':'failed','message':message})
+                except Exception: pass
             subprocess.run(['notify-send','Jellyfin Cinema',message],check=False)
         print(message,file=sys.stderr); sys.exit(1)

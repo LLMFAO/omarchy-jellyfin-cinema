@@ -108,6 +108,12 @@ class RedirectSecurityTests(unittest.TestCase):
             self.api.request("/redirect-external")
         self.assertEqual(received_authorization, [])
 
+    def test_streaming_download_api_refuses_cross_origin_redirect(self):
+        with self.assertRaisesRegex(ValueError, "different origin"):
+            self.api.open("/stream-redirect")
+        self.assertEqual(received_stream_authorization, [self.api.auth()])
+        self.assertEqual(received_authorization, [])
+
     def test_allows_redirect_within_configured_origin(self):
         self.assertEqual(self.api.request("/redirect-local"), {})
         self.assertTrue(any(TOKEN in value for value in received_local_redirect_authorization))

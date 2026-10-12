@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "paul.jellyfin",
   "name": "Jellyfin Cinema",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "author": "Paul",
   "license": "MIT",
-  "description": "Browse Jellyfin movie posters and play tiled in mpv, with terminal subtitles and now-playing artwork.",
+  "description": "Browse Jellyfin movies, play tiled in mpv, and save movies for offline playback.",
   "kinds": [
     "bar-widget"
   ],
